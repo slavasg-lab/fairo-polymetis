@@ -56,3 +56,5 @@ dependencies:
     - sphinx-book-theme
     - tqdm
     - withbullet
+    - pip:
+      - zerorpc
