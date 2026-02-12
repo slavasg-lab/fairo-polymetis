@@ -75,7 +75,7 @@ class GripperInterface:
             force: Maximum force the gripper will exert
         """
         cmd = polymetis_pb2.GripperCommand(
-            width=width, speed=speed, force=force, grasp=False
+            width=width, speed=speed, force=force, grasp=False, cancel_prev=True
         )
         cmd.timestamp.GetCurrentTime()
 
@@ -118,6 +118,7 @@ class GripperInterface:
             grasp=True,
             epsilon_inner=epsilon_inner,
             epsilon_outer=epsilon_outer,
+            cancel_prev=True
         )
         cmd.timestamp.GetCurrentTime()
 

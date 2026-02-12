@@ -51,6 +51,11 @@ void FrankaHandClient::getGripperState(void) {
 }
 
 void FrankaHandClient::applyGripperCommand(void) {
+  if (is_moving_ && gripper_cmd_.cancel_prev()) {
+    spdlog::info("Preempting previous command with new command.");
+    gripper_->stop();
+  }
+  
   is_moving_ = true;
 
   if (gripper_cmd_.grasp()) {
@@ -91,7 +96,7 @@ void FrankaHandClient::run(void) {
     grpc::ClientContext context;
     status_ = stub_->ControlUpdate(&context, gripper_state_, &gripper_cmd_);
 
-    if (!is_moving_) {
+    if (!is_moving_ || gripper_cmd_.cancel_prev()) {
       // Skip if command not updated
       timestamp_ns = gripper_cmd_.timestamp().nanos();
       if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
