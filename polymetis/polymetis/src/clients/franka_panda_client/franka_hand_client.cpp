@@ -51,31 +51,31 @@ void FrankaHandClient::getGripperState(void) {
 }
 
 void FrankaHandClient::applyGripperCommand(void) {
-  if (is_moving_ && gripper_cmd_.cancel_prev()) {
-    spdlog::info("Preempting previous command with new command.");
-    gripper_->stop();
-  }
-  
   is_moving_ = true;
 
-  if (gripper_cmd_.grasp()) {
-    spdlog::info("Grasping at width {} at speed={}", gripper_cmd_.width(),
-                 gripper_cmd_.speed());
-    double eps_inner = (gripper_cmd_.epsilon_inner() < 0)
-                           ? EPSILON_INNER
-                           : gripper_cmd_.epsilon_inner();
-    double eps_outer = (gripper_cmd_.epsilon_outer() < 0)
-                           ? EPSILON_OUTER
-                           : gripper_cmd_.epsilon_outer();
-    prev_cmd_successful_ =
-        gripper_->grasp(gripper_cmd_.width(), gripper_cmd_.speed(),
-                        gripper_cmd_.force(), eps_inner, eps_outer);
+  try {
+    if (gripper_cmd_.grasp()) {
+      spdlog::info("Grasping at width {} at speed={}", gripper_cmd_.width(),
+                  gripper_cmd_.speed());
+      double eps_inner = (gripper_cmd_.epsilon_inner() < 0)
+                            ? EPSILON_INNER
+                            : gripper_cmd_.epsilon_inner();
+      double eps_outer = (gripper_cmd_.epsilon_outer() < 0)
+                            ? EPSILON_OUTER
+                            : gripper_cmd_.epsilon_outer();
+      prev_cmd_successful_ =
+          gripper_->grasp(gripper_cmd_.width(), gripper_cmd_.speed(),
+                          gripper_cmd_.force(), eps_inner, eps_outer);
 
-  } else {
-    spdlog::info("Moving to width {} at speed={}", gripper_cmd_.width(),
-                 gripper_cmd_.speed());
-    prev_cmd_successful_ =
-        gripper_->move(gripper_cmd_.width(), gripper_cmd_.speed());
+    } else {
+      spdlog::info("Moving to width {} at speed={}", gripper_cmd_.width(),
+                  gripper_cmd_.speed());
+      prev_cmd_successful_ =
+          gripper_->move(gripper_cmd_.width(), gripper_cmd_.speed());
+    }
+  } catch (const std::exception &e) {
+    spdlog::warn("Gripper command exception: {}", e.what());
+    prev_cmd_successful_ = false;
   }
 
   is_moving_ = false;
@@ -96,7 +96,13 @@ void FrankaHandClient::run(void) {
     grpc::ClientContext context;
     status_ = stub_->ControlUpdate(&context, gripper_state_, &gripper_cmd_);
 
-    if (!is_moving_ || gripper_cmd_.cancel_prev()) {
+    if (is_moving_ && gripper_cmd_.cancel_prev()) {
+      spdlog::info("Preempting previous command with new command.");
+      gripper_->stop();
+      is_moving_ = false;
+    }
+
+    if (!is_moving_) {
       // Skip if command not updated
       timestamp_ns = gripper_cmd_.timestamp().nanos();
       if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
