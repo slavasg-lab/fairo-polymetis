@@ -58,7 +58,7 @@ So when the gripper gets stuck trying to reach an unreachable width (as mentione
 
 ## The Fix
 
-This fork simply calls `stop()` to abort the previous motion before executing any new command. This makes it work for real-time applications where policies continuously stream Franka Hand commands.
+This fork simply calls `stop()` to abort the previous motion before executing any new command if flag `cancel_prev` is set to `True`. This makes it work for real-time applications where policies continuously stream Franka Hand commands.
 
 ## Related Issues
 
