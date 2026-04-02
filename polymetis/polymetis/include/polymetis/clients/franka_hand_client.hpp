@@ -4,10 +4,15 @@
 #include "polymetis/utils.h"
 #include <grpcpp/grpcpp.h>
 
+#include <franka/exception.h>
 #include <franka/gripper.h>
 #include <franka/gripper_state.h>
 
+#include <atomic>
+#include <cmath>
+
 #define GRIPPER_HZ 30
+#define GRIPPER_WIDTH_TOLERANCE 0.002
 
 // Define tolerances to be able to grasp any object without specifying width
 #define EPSILON_INNER 0.2
@@ -21,6 +26,7 @@ private:
   // gRPC
   std::unique_ptr<GripperServer::Stub> stub_;
   grpc::Status status_;
+  std::string control_address_;
 
   GripperState gripper_state_;
   GripperCommand gripper_cmd_;
@@ -29,7 +35,12 @@ private:
 
   // Franka
   std::shared_ptr<franka::Gripper> gripper_;
-  bool is_moving_;
+  std::string robot_ip_;
+  std::atomic<bool> is_moving_;
+
+  // Command debouncing
+  float prev_cmd_width_ = -1.0f;
+  bool prev_cmd_grasp_ = false;
 
 public:
   FrankaHandClient(std::shared_ptr<grpc::Channel> channel, YAML::Node config);

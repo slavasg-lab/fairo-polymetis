@@ -15,10 +15,14 @@ using grpc::ClientContext;
 FrankaHandClient::FrankaHandClient(std::shared_ptr<grpc::Channel> channel,
                                    YAML::Node config)
     : stub_(GripperServer::NewStub(channel)) {
+  // Store connection info for reconnection
+  robot_ip_ = config["robot_ip"].as<std::string>();
+  control_address_ = config["control_ip"].as<std::string>() + ":" +
+                     config["control_port"].as<std::string>();
+
   // Connect to gripper
-  std::string robot_ip = config["robot_ip"].as<std::string>();
-  spdlog::info("Connecting to robot_ip {}", robot_ip);
-  gripper_.reset(new franka::Gripper(robot_ip));
+  spdlog::info("Connecting to robot_ip {}", robot_ip_);
+  gripper_.reset(new franka::Gripper(robot_ip_));
 
   // Initialize gripper
   gripper_->homing();
@@ -35,7 +39,7 @@ FrankaHandClient::FrankaHandClient(std::shared_ptr<grpc::Channel> channel,
   Empty empty;
   stub_->InitRobotClient(&context, metadata, &empty);
 
-  spdlog::info("Connected.", robot_ip);
+  spdlog::info("Connected.", robot_ip_);
 }
 
 void FrankaHandClient::getGripperState(void) {
@@ -90,29 +94,66 @@ void FrankaHandClient::run(void) {
   struct timespec abs_target_time;
   clock_gettime(CLOCK_REALTIME, &abs_target_time);
   while (true) {
-    // Run control step
-    getGripperState();
+    try {
+      // Run control step
+      getGripperState();
 
-    grpc::ClientContext context;
-    status_ = stub_->ControlUpdate(&context, gripper_state_, &gripper_cmd_);
+      grpc::ClientContext context;
+      status_ = stub_->ControlUpdate(&context, gripper_state_, &gripper_cmd_);
 
-    if (is_moving_ && gripper_cmd_.cancel_prev()) {
-      spdlog::info("Preempting previous command with new command.");
-      gripper_->stop();
-      is_moving_ = false;
-    }
-
-    if (!is_moving_) {
-      // Skip if command not updated
-      timestamp_ns = gripper_cmd_.timestamp().nanos();
-      if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
-        // applyGripperCommand() in separate thread
-        std::thread th(&FrankaHandClient::applyGripperCommand, this);
-        th.detach();
-        prev_cmd_timestamp_ns_ = timestamp_ns;
+      if (!status_.ok()) {
+        spdlog::warn("Gripper ControlUpdate failed: {}. Retrying...",
+                     status_.error_message());
+        goto sleep;
       }
+
+      if (is_moving_ && gripper_cmd_.cancel_prev()) {
+        spdlog::info("Preempting previous command with new command.");
+        try {
+          gripper_->stop();
+        } catch (const std::exception &e) {
+          spdlog::warn("Failed to stop gripper: {}", e.what());
+        }
+        is_moving_ = false;
+      }
+
+      if (!is_moving_) {
+        // Skip if command not updated
+        timestamp_ns = gripper_cmd_.timestamp().nanos();
+        if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
+          // Debounce: only execute if target changed significantly
+          float width_delta =
+              std::abs(gripper_cmd_.width() - prev_cmd_width_);
+          bool grasp_changed = (gripper_cmd_.grasp() != prev_cmd_grasp_);
+
+          if (width_delta > GRIPPER_WIDTH_TOLERANCE || grasp_changed ||
+              prev_cmd_width_ < 0) {
+            // applyGripperCommand() in separate thread
+            std::thread th(&FrankaHandClient::applyGripperCommand, this);
+            th.detach();
+            prev_cmd_width_ = gripper_cmd_.width();
+            prev_cmd_grasp_ = gripper_cmd_.grasp();
+          }
+          prev_cmd_timestamp_ns_ = timestamp_ns;
+        }
+      }
+    } catch (const franka::NetworkException &e) {
+      spdlog::error("Gripper network error: {}. Attempting reconnection...",
+                    e.what());
+      try {
+        gripper_.reset(new franka::Gripper(robot_ip_));
+        spdlog::info("Gripper reconnected successfully.");
+      } catch (const std::exception &e2) {
+        spdlog::error("Gripper reconnection failed: {}. Will retry...",
+                      e2.what());
+        usleep(1000000);
+      }
+    } catch (const std::exception &e) {
+      spdlog::error("Gripper control loop error: {}. Continuing...", e.what());
+      usleep(100000);
     }
 
+  sleep:
     // Spin once
     abs_target_time.tv_nsec += period_ns;
     clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_target_time, nullptr);

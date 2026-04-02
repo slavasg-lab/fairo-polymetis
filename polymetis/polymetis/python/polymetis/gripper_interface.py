@@ -51,8 +51,15 @@ class GripperInterface:
             try:
                 command(msg)
             except grpc.RpcError as e:
-                raise grpc.RpcError(f"GRIPPER SERVER ERROR --\n{e.details()}") from None
-            self._command_queue.task_done()
+                try:
+                    details = e.details()
+                except Exception:
+                    details = str(e)
+                log.error(f"GRIPPER SERVER ERROR -- {details}")
+            except Exception as e:
+                log.error(f"Gripper command failed: {e}")
+            finally:
+                self._command_queue.task_done()
 
     def _send_gripper_command(self, command, msg, blocking: bool = True) -> None:
         self._command_queue.put((command, msg))

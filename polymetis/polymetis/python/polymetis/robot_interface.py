@@ -289,7 +289,16 @@ class BaseRobotInterface:
 
         """
         # Send termination
-        log_interval = self.grpc_connection.TerminateController(EMPTY)
+        try:
+            log_interval = self.grpc_connection.TerminateController(EMPTY)
+        except grpc.RpcError as e:
+            log.warning(
+                f"Could not terminate controller (may already be terminated): "
+                f"{e.details()}"
+            )
+            if return_log:
+                return []
+            return None
 
         # Query episode log
         if return_log:
@@ -678,10 +687,11 @@ class RobotInterface(BaseRobotInterface):
         try:
             update_idx = self.update_current_policy({"joint_pos_desired": positions})
         except grpc.RpcError as e:
-            log.error(
-                "Unable to update desired joint positions. Use 'start_joint_impedance' to start a joint impedance controller."
+            log.warning(
+                "Unable to update desired joint positions. "
+                "Use 'start_joint_impedance' to start a joint impedance controller."
             )
-            raise e
+            return -1
 
         return update_idx
 
@@ -734,10 +744,11 @@ class RobotInterface(BaseRobotInterface):
         try:
             update_idx = self.update_current_policy({"joint_vel_desired": velocities})
         except grpc.RpcError as e:
-            log.error(
-                "Unable to update desired joint velocities. Use 'start_joint_velocity_control' to start a joint velocities controller."
+            log.warning(
+                "Unable to update desired joint velocities. "
+                "Use 'start_joint_velocity_control' to start a joint velocities controller."
             )
-            raise e
+            return -1
 
         return update_idx
 

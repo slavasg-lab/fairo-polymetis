@@ -53,7 +53,7 @@ private:
   struct TorchInput *empty_input_ = nullptr;
 
 public:
-  TorchScriptedController(char *data, size_t size,
+  TorchScriptedController(char *data, std::size_t size,
                           TorchRobotState &init_robot_state);
   ~TorchScriptedController();
 
@@ -61,7 +61,7 @@ public:
 
   std::vector<float> forward(TorchRobotState &input);
 
-  bool param_dict_load(char *data, size_t size);
+  bool param_dict_load(char *data, std::size_t size);
   void param_dict_update_module();
 
   bool is_terminated();

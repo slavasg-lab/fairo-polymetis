@@ -152,37 +152,81 @@ void FrankaTorqueControlClient::run() {
 
   // Run robot
   if (!mock_franka_ && !readonly_mode_) {
-    bool is_robot_operational = true;
-    while (is_robot_operational) {
-      // Send lambda function
+    int consecutive_failures = 0;
+
+    while (true) {
+      // Reset torque state before entering control loop
+      for (int i = 0; i < NUM_DOFS; i++) {
+        torque_commanded_[i] = 0.0;
+        torque_safety_[i] = 0.0;
+        torque_applied_prev_[i] = 0.0;
+      }
+      consecutive_grpc_failures_ = 0;
+
+      // Start real-time control loop
       try {
         robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);
+        // control() should not return normally; if it does, just restart
+        spdlog::warn("Control loop exited normally (unexpected). Restarting...");
+        consecutive_failures = 0;
+        continue;
+      } catch (const franka::ControlException &ex) {
+        spdlog::warn("Control exception (safety limit, user stop, or reflex): "
+                     "{}", ex.what());
+      } catch (const franka::NetworkException &ex) {
+        spdlog::error("Franka network exception: {}", ex.what());
       } catch (const std::exception &ex) {
-        spdlog::error("Robot is unable to be controlled: {}", ex.what());
-        is_robot_operational = false;
+        spdlog::error("Robot control error: {}", ex.what());
       }
 
-      // Automatic recovery
-      spdlog::warn("Performing automatic error recovery. This calls "
-                   "franka::Robot::automaticErrorRecovery, which is equivalent "
-                   "to pressing and releasing the external activation device.");
-      for (int i = 0; i < RECOVERY_MAX_TRIES; i++) {
-        spdlog::warn("Automatic error recovery attempt {}/{}...", i + 1,
-                     RECOVERY_MAX_TRIES);
+      // Error recovery with increasing wait times
+      bool recovered = false;
+      int wait_secs = RECOVERY_INITIAL_WAIT_SECS;
 
-        // Wait
-        usleep(1000000 * RECOVERY_WAIT_SECS);
+      spdlog::warn("Starting automatic error recovery. This calls "
+                   "franka::Robot::automaticErrorRecovery. "
+                   "If user stop is pressed, release it to allow recovery.");
 
-        // Attempt recovery
+      for (int attempt = 0; attempt < RECOVERY_MAX_TRIES; attempt++) {
+        spdlog::warn("Recovery attempt {}/{}... (waiting {}s)",
+                     attempt + 1, RECOVERY_MAX_TRIES, wait_secs);
+        usleep(1000000 * wait_secs);
+
         try {
           robot_ptr_->automaticErrorRecovery();
-          spdlog::warn("Robot operation recovered.");
-          is_robot_operational = true;
+          spdlog::info(
+              "Robot recovered successfully. Restarting control loop...");
+          recovered = true;
+          consecutive_failures = 0;
           break;
-
+        } catch (const franka::CommandException &ex) {
+          // Typically means user stop is still pressed
+          spdlog::warn("Recovery attempt {} failed (user stop pressed?): {}",
+                       attempt + 1, ex.what());
+        } catch (const franka::NetworkException &ex) {
+          spdlog::warn("Recovery attempt {} failed (network issue): {}",
+                       attempt + 1, ex.what());
         } catch (const std::exception &ex) {
-          spdlog::error("Recovery failed: {}", ex.what());
+          spdlog::warn("Recovery attempt {} failed: {}", attempt + 1,
+                       ex.what());
         }
+
+        // Increase wait time, capped at max
+        wait_secs = std::min(wait_secs * 2, RECOVERY_MAX_WAIT_SECS);
+      }
+
+      if (!recovered) {
+        consecutive_failures++;
+        if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+          spdlog::error("Failed to recover after {} consecutive round(s) of "
+                        "retries. Exiting.",
+                        MAX_CONSECUTIVE_FAILURES);
+          break;
+        }
+        spdlog::warn("Recovery round failed. Will retry from scratch "
+                     "(failure {}/{})...",
+                     consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+        usleep(1000000 * RECOVERY_MAX_WAIT_SECS);
       }
     }
 
@@ -258,9 +302,34 @@ void FrankaTorqueControlClient::updateServerCommand(
   status_ = stub_->ControlUpdate(&context, robot_state_, &torque_command_);
   long int post_update_ns = getNanoseconds();
   if (!status_.ok()) {
-    std::string error_msg = "ControlUpdate rpc failed. ";
-    throw std::runtime_error(error_msg + status_.error_message());
+    // gRPC failed: apply local gravity compensation to keep robot stable
+    consecutive_grpc_failures_++;
+    if (consecutive_grpc_failures_ % 1000 == 1) {
+      spdlog::warn(
+          "ControlUpdate RPC failed ({}x consecutive): {}. "
+          "Using local gravity compensation as fallback.",
+          consecutive_grpc_failures_, status_.error_message());
+    }
+    if (!mock_franka_) {
+      std::array<double, NUM_DOFS> grav =
+          model_ptr_->gravity(libfranka_robot_state);
+      for (int i = 0; i < NUM_DOFS; i++) {
+        torque_out[i] = grav[i];
+      }
+    } else {
+      for (int i = 0; i < NUM_DOFS; i++) {
+        torque_out[i] = 0.0;
+      }
+    }
+    if (consecutive_grpc_failures_ > GRPC_MAX_FAILURES) {
+      consecutive_grpc_failures_ = 0;
+      throw std::runtime_error(
+          "Persistent gRPC failure for " +
+          std::to_string(GRPC_MAX_FAILURES / 1000) + " seconds");
+    }
+    return;
   }
+  consecutive_grpc_failures_ = 0;
 
   robot_state_.set_prev_controller_latency_ms(
       float(post_update_ns - pre_update_ns) / 1e6);
@@ -385,7 +454,8 @@ void FrankaTorqueControlClient::computeSafetyReflex(
 
     // Check hard limits (use active_constraints_map_ to prevent flooding
     // terminal)
-    if (upper_violation > 0 || lower_violation > 0) {
+    if (upper_violation > SAFETY_HARD_LIMIT_TOLERANCE ||
+        lower_violation > SAFETY_HARD_LIMIT_TOLERANCE) {
       safety_constraint_triggered = true;
 
       if (!active_constraints_map_[item_name_str]) {

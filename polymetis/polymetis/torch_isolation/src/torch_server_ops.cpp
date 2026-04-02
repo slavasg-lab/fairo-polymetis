@@ -17,7 +17,7 @@ A preallocated chunk of memory, required to convert a char array to an istream.
 */
 class membuf : public std::basic_streambuf<char> {
 public:
-  membuf(const char *p, size_t l) {
+  membuf(const char *p, std::size_t l) {
     this->setg((char *)p, (char *)p, (char *)p + l);
   }
 
@@ -42,7 +42,7 @@ TODO
 */
 class memstream : public std::istream {
 public:
-  memstream(const char *p, size_t l) : std::istream(&_buffer), _buffer(p, l) {
+  memstream(const char *p, std::size_t l) : std::istream(&_buffer), _buffer(p, l) {
     rdbuf(&_buffer);
   }
 
@@ -114,7 +114,7 @@ void TorchRobotState::update_state(int timestamp_s, int timestamp_ns,
 }
 
 TorchScriptedController::TorchScriptedController(
-    char *data, size_t size, TorchRobotState &init_robot_state) {
+    char *data, std::size_t size, TorchRobotState &init_robot_state) {
   memstream stream(data, size);
   module_ = new TorchScriptModule{torch::jit::load(stream)};
 
@@ -170,7 +170,7 @@ void TorchScriptedController::reset() {
   module_->data.get_method("reset")(empty_input_->data);
 }
 
-bool TorchScriptedController::param_dict_load(char *data, size_t size) {
+bool TorchScriptedController::param_dict_load(char *data, std::size_t size) {
   memstream model_stream(data, size);
 
   torch::jit::script::Module param_dict_container;

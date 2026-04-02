@@ -79,9 +79,37 @@ def main(cfg):
             if time.time() - t0 > cfg.timeout:
                 raise ConnectionError("Robot client: Unable to locate server.")
 
-        log.info(f"Starting robot client...")
-        client = hydra.utils.instantiate(cfg.robot_client)
-        client.run()
+        max_restarts = 10
+        restart_delay = 5
+        for attempt in range(max_restarts):
+            try:
+                if attempt > 0:
+                    log.info(
+                        f"Restarting robot client (attempt {attempt + 1}/{max_restarts})..."
+                    )
+                else:
+                    log.info(f"Starting robot client...")
+
+                client = hydra.utils.instantiate(cfg.robot_client)
+                client.run()
+                log.info("Robot client exited normally.")
+                break
+
+            except subprocess.CalledProcessError as e:
+                log.warning(
+                    f"Robot client exited with error (code {e.returncode}). "
+                    f"Restarting in {restart_delay}s..."
+                )
+                time.sleep(restart_delay)
+            except Exception as e:
+                log.warning(
+                    f"Robot client error: {e}. Restarting in {restart_delay}s..."
+                )
+                time.sleep(restart_delay)
+        else:
+            log.error(
+                f"Robot client failed after {max_restarts} restart attempts."
+            )
 
     else:
         signal.pause()

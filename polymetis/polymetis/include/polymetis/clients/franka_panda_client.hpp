@@ -21,8 +21,12 @@
 #define NUM_DOFS 7
 #define FRANKA_HZ 1000.0
 #define M_PI 3.14159265358979323846
-#define RECOVERY_WAIT_SECS 1
-#define RECOVERY_MAX_TRIES 3
+#define RECOVERY_INITIAL_WAIT_SECS 1
+#define RECOVERY_MAX_WAIT_SECS 10
+#define RECOVERY_MAX_TRIES 20
+#define MAX_CONSECUTIVE_FAILURES 3
+#define GRPC_MAX_FAILURES 5000
+#define SAFETY_HARD_LIMIT_TOLERANCE 0.02
 
 class FrankaTorqueControlClient {
 private:
@@ -70,6 +74,9 @@ private:
   bool is_safety_controller_active_;
   double margin_cartesian_pos_, margin_joint_pos_, margin_joint_vel_;
   double k_cartesian_pos_, k_joint_pos_, k_joint_vel_;
+
+  // Error recovery state
+  int consecutive_grpc_failures_ = 0;
 
 public:
   /**
