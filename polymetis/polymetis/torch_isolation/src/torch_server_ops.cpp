@@ -3,7 +3,9 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 #include "torch_server_ops.hpp"
+#include <cstring>
 #include <istream>
+#include <stdexcept>
 #include <streambuf>
 #include <torch/jit.h>
 #include <torch/script.h>
@@ -64,25 +66,49 @@ struct StateDict {
   c10::Dict<std::string, torch::Tensor> data;
 };
 
+namespace {
+
+void ResizeStateTensors(TorchTensor *timestamp, TorchTensor *joint_positions,
+                        TorchTensor *joint_velocities,
+                        TorchTensor *motor_torques_measured,
+                        TorchTensor *motor_torques_external,
+                        StateDict *state_dict, int num_dofs) {
+  timestamp->data =
+      torch::zeros({2}, torch::TensorOptions().dtype(torch::kInt32));
+  joint_positions->data =
+      torch::zeros({num_dofs}, torch::TensorOptions().dtype(torch::kFloat32));
+  joint_velocities->data =
+      torch::zeros({num_dofs}, torch::TensorOptions().dtype(torch::kFloat32));
+  motor_torques_measured->data =
+      torch::zeros({num_dofs}, torch::TensorOptions().dtype(torch::kFloat32));
+  motor_torques_external->data =
+      torch::zeros({num_dofs}, torch::TensorOptions().dtype(torch::kFloat32));
+
+  state_dict->data.insert_or_assign("timestamp", timestamp->data);
+  state_dict->data.insert_or_assign("joint_positions", joint_positions->data);
+  state_dict->data.insert_or_assign("joint_velocities", joint_velocities->data);
+  state_dict->data.insert_or_assign("motor_torques_measured",
+                                    motor_torques_measured->data);
+  state_dict->data.insert_or_assign("motor_torques_external",
+                                    motor_torques_external->data);
+}
+
+} // namespace
+
 TorchRobotState::TorchRobotState(int num_dofs) {
   num_dofs_ = num_dofs;
 
   // Create initial state dictionary
-  rs_timestamp_ = new TorchTensor{torch::zeros(2).to(torch::kInt32)};
-  rs_joint_positions_ = new TorchTensor{torch::zeros(num_dofs)};
-  rs_joint_velocities_ = new TorchTensor{torch::zeros(num_dofs)};
-  rs_motor_torques_measured_ = new TorchTensor{torch::zeros(num_dofs)};
-  rs_motor_torques_external_ = new TorchTensor{torch::zeros(num_dofs)};
+  rs_timestamp_ = new TorchTensor{};
+  rs_joint_positions_ = new TorchTensor{};
+  rs_joint_velocities_ = new TorchTensor{};
+  rs_motor_torques_measured_ = new TorchTensor{};
+  rs_motor_torques_external_ = new TorchTensor{};
 
   state_dict_ = new StateDict{c10::Dict<std::string, torch::Tensor>()};
-
-  state_dict_->data.insert("timestamp", rs_timestamp_->data);
-  state_dict_->data.insert("joint_positions", rs_joint_positions_->data);
-  state_dict_->data.insert("joint_velocities", rs_joint_velocities_->data);
-  state_dict_->data.insert("motor_torques_measured",
-                           rs_motor_torques_measured_->data);
-  state_dict_->data.insert("motor_torques_external",
-                           rs_motor_torques_external_->data);
+  ResizeStateTensors(rs_timestamp_, rs_joint_positions_, rs_joint_velocities_,
+                     rs_motor_torques_measured_, rs_motor_torques_external_,
+                     state_dict_, num_dofs_);
 
   input_ = new TorchInput{std::vector<torch::jit::IValue>()};
   input_->data.push_back(state_dict_->data);
@@ -99,18 +125,47 @@ TorchRobotState::~TorchRobotState() {
 }
 
 void TorchRobotState::update_state(int timestamp_s, int timestamp_ns,
-                                   std::vector<float> joint_positions,
-                                   std::vector<float> joint_velocities,
-                                   std::vector<float> motor_torques_measured,
-                                   std::vector<float> motor_torques_external) {
-  rs_timestamp_->data[0] = timestamp_s;
-  rs_timestamp_->data[1] = timestamp_ns;
-  for (int i = 0; i < joint_positions.size(); i++) {
-    rs_joint_positions_->data[i] = joint_positions[i];
-    rs_joint_velocities_->data[i] = joint_velocities[i];
-    rs_motor_torques_measured_->data[i] = motor_torques_measured[i];
-    rs_motor_torques_external_->data[i] = motor_torques_external[i];
+                                   const std::vector<float> &joint_positions,
+                                   const std::vector<float> &joint_velocities,
+                                   const std::vector<float> &motor_torques_measured,
+                                   const std::vector<float> &motor_torques_external) {
+  std::size_t num_joints = joint_positions.size();
+  if (num_joints == 0) {
+    throw std::runtime_error(
+        "TorchRobotState::update_state received empty joint state vector");
   }
+  if (joint_velocities.size() != num_joints ||
+      motor_torques_measured.size() != num_joints ||
+      motor_torques_external.size() != num_joints) {
+    throw std::runtime_error(
+        "TorchRobotState::update_state received inconsistent vector sizes");
+  }
+
+  if (rs_timestamp_->data.numel() != 2 ||
+      rs_joint_positions_->data.numel() != static_cast<long>(num_joints) ||
+      rs_joint_velocities_->data.numel() != static_cast<long>(num_joints) ||
+      rs_motor_torques_measured_->data.numel() !=
+          static_cast<long>(num_joints) ||
+      rs_motor_torques_external_->data.numel() !=
+          static_cast<long>(num_joints)) {
+    ResizeStateTensors(rs_timestamp_, rs_joint_positions_, rs_joint_velocities_,
+                       rs_motor_torques_measured_, rs_motor_torques_external_,
+                       state_dict_, static_cast<int>(num_joints));
+    num_dofs_ = static_cast<int>(num_joints);
+  }
+
+  int32_t *timestamp_ptr = rs_timestamp_->data.data_ptr<int32_t>();
+  timestamp_ptr[0] = timestamp_s;
+  timestamp_ptr[1] = timestamp_ns;
+
+  std::memcpy(rs_joint_positions_->data.data_ptr<float>(),
+              joint_positions.data(), num_joints * sizeof(float));
+  std::memcpy(rs_joint_velocities_->data.data_ptr<float>(),
+              joint_velocities.data(), num_joints * sizeof(float));
+  std::memcpy(rs_motor_torques_measured_->data.data_ptr<float>(),
+              motor_torques_measured.data(), num_joints * sizeof(float));
+  std::memcpy(rs_motor_torques_external_->data.data_ptr<float>(),
+              motor_torques_external.data(), num_joints * sizeof(float));
 }
 
 TorchScriptedController::TorchScriptedController(
@@ -146,6 +201,24 @@ std::vector<float> TorchScriptedController::forward(TorchRobotState &input) {
     result.push_back(desired_torque[i].item<float>());
   }
   return result;
+}
+
+void TorchScriptedController::forward_into(std::vector<float> &output,
+                                           TorchRobotState &input) {
+  torch::NoGradGuard no_grad;
+  c10::Dict<torch::jit::IValue, torch::jit::IValue> controller_state_dict =
+      module_->data.forward(input.input_->data).toGenericDict();
+
+  torch::jit::IValue key = torch::jit::IValue("joint_torques");
+  torch::Tensor desired_torque = controller_state_dict.at(key).toTensor();
+
+  // Write directly into pre-allocated output vector
+  const float *data_ptr = desired_torque.data_ptr<float>();
+  int n = input.num_dofs_;
+  if ((int)output.size() != n) {
+    output.resize(n);
+  }
+  std::memcpy(output.data(), data_ptr, n * sizeof(float));
 }
 
 void TorchScriptedController::warmup_controller(

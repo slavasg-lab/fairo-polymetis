@@ -23,6 +23,20 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+// CPU core to pin the real-time thread to.
+// Default: core 5 (second of the already-isolated CPUs 4-7 on this system).
+// Server is pinned to core 4 by launch_robot.py, so client uses core 5.
+// Set POLYMETIS_RT_CPU env var to override.
+static int get_rt_cpu() {
+  const char *env = getenv("POLYMETIS_RT_CPU");
+  if (env) {
+    int cpu = atoi(env);
+    if (cpu >= 0)
+      return cpu;
+  }
+  return 5; // Default: isolated core 5
+}
+
 int write_cpu_dma_latency(int max_latency_microseconds) {
   int fd = open("/dev/cpu_dma_latency", O_WRONLY);
   if (fd < 0) {
@@ -125,6 +139,22 @@ int create_real_time_thread(void *(*start_routine)(void *), void *arg = NULL) {
     goto out;
   }
   printf("Started realtime thread.\n");
+
+  /* Pin thread to a specific CPU core to avoid migration */
+  {
+    int rt_cpu = get_rt_cpu();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(rt_cpu, &cpuset);
+    ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    if (ret) {
+      printf("Warning: failed to pin RT thread to CPU %d (error %d). "
+             "Continuing without CPU affinity.\n",
+             rt_cpu, ret);
+    } else {
+      printf("Pinned realtime thread to CPU %d.\n", rt_cpu);
+    }
+  }
 
   /* Join the thread and wait until it is done */
   ret = pthread_join(thread, NULL);

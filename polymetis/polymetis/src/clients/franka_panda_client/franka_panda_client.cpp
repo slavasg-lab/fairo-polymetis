@@ -18,6 +18,7 @@
 #include <sstream>
 
 #include <grpc/grpc.h>
+#include <grpcpp/grpcpp.h>
 
 using grpc::ClientContext;
 using grpc::Status;
@@ -30,18 +31,30 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
 
   // Load robot client metadata
   std::ifstream file(robot_client_metadata_path);
-  assert(file);
+  if (!file) {
+    throw std::runtime_error(
+        "Failed to open robot client metadata file: " +
+        robot_client_metadata_path);
+  }
   std::stringstream buffer;
   buffer << file.rdbuf();
   file.close();
   RobotClientMetadata metadata;
-  assert(metadata.ParseFromString(buffer.str()));
+  if (!metadata.ParseFromString(buffer.str())) {
+    throw std::runtime_error(
+        "Failed to parse robot client metadata from: " +
+        robot_client_metadata_path);
+  }
+  spdlog::info("Loaded metadata: dof={}, hz={}", metadata.dof(), metadata.hz());
 
   // Initialize robot client with metadata
   ClientContext context;
   Empty empty;
   Status status = stub_->InitRobotClient(&context, metadata, &empty);
-  assert(status.ok());
+  if (!status.ok()) {
+    throw std::runtime_error("InitRobotClient failed: " +
+                             status.error_message());
+  }
 
   // Connect to robot
   mock_franka_ = config["mock"].as<bool>();
@@ -302,6 +315,18 @@ void FrankaTorqueControlClient::updateServerCommand(
   status_ = stub_->ControlUpdate(&context, robot_state_, &torque_command_);
   long int post_update_ns = getNanoseconds();
   if (!status_.ok()) {
+    // Do not continue the hardware loop under server-internal state errors.
+    // Falling back to gravity compensation is reasonable for transient RPC
+    // transport issues, but not for deterministic server corruption/mismatch.
+    if (status_.error_code() == grpc::StatusCode::INTERNAL ||
+      status_.error_message().find("update_state failed") !=
+        std::string::npos ||
+      status_.error_message().find("No controller available") !=
+        std::string::npos) {
+      throw std::runtime_error("ControlUpdate server-side state error: " +
+                   status_.error_message());
+    }
+
     // gRPC failed: apply local gravity compensation to keep robot stable
     consecutive_grpc_failures_++;
     if (consecutive_grpc_failures_ % 1000 == 1) {
@@ -334,7 +359,12 @@ void FrankaTorqueControlClient::updateServerCommand(
   robot_state_.set_prev_controller_latency_ms(
       float(post_update_ns - pre_update_ns) / 1e6);
 
-  assert(torque_command_.joint_torques_size() == NUM_DOFS);
+  if (torque_command_.joint_torques_size() != NUM_DOFS) {
+    throw std::runtime_error(
+        "Server returned " +
+        std::to_string(torque_command_.joint_torques_size()) +
+        " torques, expected " + std::to_string(NUM_DOFS));
+  }
   for (int i = 0; i < NUM_DOFS; i++) {
     torque_out[i] = torque_command_.joint_torques(i);
     robot_state_.set_prev_joint_torques_computed(
@@ -372,19 +402,31 @@ void FrankaTorqueControlClient::checkStateLimits(
                       cartesian_pos_ulimits_, false, force_buf,
                       margin_cartesian_pos_, k_cartesian_pos_, "EE position");
 
-  std::array<double, 6 *NUM_DOFS> jacobian_array = model_ptr_->zeroJacobian(
-      franka::Frame::kEndEffector, libfranka_robot_state);
-  Eigen::Map<const Eigen::Matrix<double, 6, NUM_DOFS>> jacobian(
-      jacobian_array.data());
-  Eigen::Map<const Eigen::Vector3d> force_xyz_vec(force_buf.data());
+  // Only compute the Jacobian and map force→torque if the cartesian safety
+  // reflex actually produced a non-zero force command. The Jacobian call is
+  // the heaviest operation in this function (~model_ptr_->zeroJacobian),
+  // so skipping it when the robot is well within limits reduces cycle cost.
+  bool cartesian_force_active = false;
+  for (int i = 0; i < 3; i++) {
+    if (force_buf[i] != 0.0) { cartesian_force_active = true; break; }
+  }
 
-  Eigen::VectorXd force_vec(6);
-  force_vec.head(3) << force_xyz_vec;
-  force_vec.tail(3) << Eigen::Vector3d::Zero();
+  if (cartesian_force_active) {
+    // Use fixed-size Eigen types to avoid heap allocation (VectorXd would
+    // allocate on the heap; Matrix<double,N,1> is stack-allocated).
+    std::array<double, 6 * NUM_DOFS> jacobian_array = model_ptr_->zeroJacobian(
+        franka::Frame::kEndEffector, libfranka_robot_state);
+    Eigen::Map<const Eigen::Matrix<double, 6, NUM_DOFS>> jacobian(
+        jacobian_array.data());
+    Eigen::Map<const Eigen::Vector3d> force_xyz_vec(force_buf.data());
 
-  Eigen::VectorXd torque_vec(NUM_DOFS);
-  torque_vec << jacobian.transpose() * force_vec;
-  Eigen::VectorXd::Map(&torque_out[0], NUM_DOFS) = torque_vec;
+    Eigen::Matrix<double, 6, 1> force_vec;
+    force_vec.head(3) = force_xyz_vec;
+    force_vec.tail(3).setZero();
+
+    Eigen::Matrix<double, NUM_DOFS, 1> torque_vec = jacobian.transpose() * force_vec;
+    Eigen::Matrix<double, NUM_DOFS, 1>::Map(&torque_out[0]) = torque_vec;
+  }
 
   // Joint position limits
   computeSafetyReflex(libfranka_robot_state.q, joint_pos_llimits_,
@@ -433,19 +475,16 @@ void FrankaTorqueControlClient::computeSafetyReflex(
    * and torques.)
    */
   double upper_violation, lower_violation;
-  double lower_sign = 1.0;
+  double lower_sign = invert_lower ? -1.0 : 1.0;
   bool safety_constraint_triggered = false;
 
-  std::string item_name_str(item_name);
-  if (invert_lower) {
-    lower_sign = -1.0;
+  // Use pointer as key to avoid std::string allocation in the hot path
+  // (item_name is always a string literal)
+  auto it = active_constraints_map_.find(item_name);
+  if (it == active_constraints_map_.end()) {
+    it = active_constraints_map_.emplace(item_name, false).first;
   }
-
-  // Init constraint active map
-  if (active_constraints_map_.find(item_name_str) ==
-      active_constraints_map_.end()) {
-    active_constraints_map_.emplace(std::make_pair(item_name_str, false));
-  }
+  bool &constraint_active = it->second;
 
   // Check limits & compute safety controller
   for (int i = 0; i < N; i++) {
@@ -458,15 +497,15 @@ void FrankaTorqueControlClient::computeSafetyReflex(
         lower_violation > SAFETY_HARD_LIMIT_TOLERANCE) {
       safety_constraint_triggered = true;
 
-      if (!active_constraints_map_[item_name_str]) {
-        active_constraints_map_[item_name_str] = true;
+      if (!constraint_active) {
+        constraint_active = true;
 
         spdlog::warn("Safety limits exceeded: "
                      "\n\ttype = \"{}\""
                      "\n\tdim = {}"
                      "\n\tlimits = {}, {}"
                      "\n\tvalue = {}",
-                     item_name_str, i, lower_sign * lower_limit[i],
+                     item_name, i, lower_sign * lower_limit[i],
                      upper_limit[i], values[i]);
 
         std::string error_str =
@@ -490,21 +529,34 @@ void FrankaTorqueControlClient::computeSafetyReflex(
   }
 
   // Reset constraint active map
-  if (!safety_constraint_triggered && active_constraints_map_[item_name_str]) {
-    active_constraints_map_[item_name_str] = false;
-    spdlog::info("Safety limits no longer violated: \"{}\"", item_name_str);
+  if (!safety_constraint_triggered && constraint_active) {
+    constraint_active = false;
+    spdlog::info("Safety limits no longer violated: \"{}\"", item_name);
   }
 }
 
 void *rt_main(void *cfg_ptr) {
   YAML::Node &config = *(static_cast<YAML::Node *>(cfg_ptr));
 
-  // Launch adapter
+  // Launch adapter with tuned gRPC channel
   std::string control_address = config["control_ip"].as<std::string>() + ":" +
                                 config["control_port"].as<std::string>();
-  FrankaTorqueControlClient franka_panda_client(
-      grpc::CreateChannel(control_address, grpc::InsecureChannelCredentials()),
-      config);
+
+  grpc::ChannelArguments ch_args;
+  // Disable Nagle — send immediately
+  ch_args.SetInt(GRPC_ARG_TCP_READ_CHUNK_SIZE, 256);
+  // Keepalive to detect stale connections
+  ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
+  ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+  ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+  ch_args.SetInt(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 5000);
+  // Limit HTTP2 stream count since we only use one RPC at a time
+  ch_args.SetInt(GRPC_ARG_MAX_CONCURRENT_STREAMS, 4);
+
+  auto channel = grpc::CreateCustomChannel(
+      control_address, grpc::InsecureChannelCredentials(), ch_args);
+
+  FrankaTorqueControlClient franka_panda_client(channel, config);
   franka_panda_client.run();
 
   return NULL;

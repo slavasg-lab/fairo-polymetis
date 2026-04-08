@@ -175,6 +175,14 @@ private:
   RobotClientContext robot_client_context_;
 
   std::unique_ptr<TorchRobotState> torch_robot_state_;
+
+  // Pre-allocated buffers for ControlUpdate hot path (avoid per-call heap
+  // allocations)
+  std::vector<float> update_joint_positions_;
+  std::vector<float> update_joint_velocities_;
+  std::vector<float> update_motor_torques_measured_;
+  std::vector<float> update_motor_torques_external_;
+  std::vector<float> update_desired_torque_;
 };
 
 #endif

@@ -8,14 +8,15 @@
 #include <chrono>
 #include <istream>
 #include <streambuf>
+#include <time.h>
 #include <vector>
 
 #include "polymetis.grpc.pb.h"
 
 /**
 Circular buffer class. Preallocates a std::vector with a certain capacity, then
-around. Returns NULL* if attempting to an element that is too stale (i.e. when
-buffer is above capacity, it drops the earliest elements).
+wraps around. Returns NULL* if attempting to access an element that is too stale
+(i.e. when buffer is above capacity, it drops the earliest elements).
 */
 template <typename T> class CircularBuffer {
 private:
@@ -23,16 +24,15 @@ private:
   ulong index = 0;
 
 public:
-  CircularBuffer<T>(int capacity) { elems.reserve(capacity); }
+  CircularBuffer<T>(int capacity) { elems.resize(capacity); }
 
-  std::size_t capacity() { return elems.capacity(); }
+  std::size_t capacity() { return elems.size(); }
 
   void clear() {
     index = 0;
-    elems.clear();
   }
 
-  void append(T elem) {
+  void append(const T &elem) {
     elems[index % capacity()] = elem;
     index++;
   }
@@ -55,19 +55,19 @@ Time utilities
 Returns  nanoseconds as int.
 */
 inline long int getNanoseconds() {
-  auto epoch_time =
-      std::chrono::high_resolution_clock::now().time_since_epoch();
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(epoch_time)
-      .count();
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  return (long int)ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
 /**
 Sets timestamp to current time.
 */
 inline bool setTimestampToNow(google::protobuf::Timestamp *timestamp_ptr) {
-  long int ns = getNanoseconds();
-  timestamp_ptr->set_seconds(ns / 1e9);
-  timestamp_ptr->set_nanos(ns % (long int)1e9);
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  timestamp_ptr->set_seconds(ts.tv_sec);
+  timestamp_ptr->set_nanos(ts.tv_nsec);
   return true;
 }
 

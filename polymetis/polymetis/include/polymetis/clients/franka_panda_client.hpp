@@ -70,7 +70,7 @@ private:
   double elbow_vel_limit_;
 
   // safety controller
-  std::unordered_map<std::string, bool> active_constraints_map_;
+  std::unordered_map<const char *, bool> active_constraints_map_;
   bool is_safety_controller_active_;
   double margin_cartesian_pos_, margin_joint_pos_, margin_joint_vel_;
   double k_cartesian_pos_, k_joint_pos_, k_joint_vel_;

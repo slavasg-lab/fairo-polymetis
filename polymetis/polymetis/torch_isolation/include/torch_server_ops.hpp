@@ -35,10 +35,10 @@ public:
   TorchRobotState(int num_dofs);
   ~TorchRobotState();
   void update_state(int timestamp_s, int timestamp_ns,
-                    std::vector<float> joint_positions,
-                    std::vector<float> joint_velocities,
-                    std::vector<float> motor_torques_measured,
-                    std::vector<float> motor_torques_external);
+                    const std::vector<float> &joint_positions,
+                    const std::vector<float> &joint_velocities,
+                    const std::vector<float> &motor_torques_measured,
+                    const std::vector<float> &motor_torques_external);
   struct TorchInput *input_ = nullptr;
   int num_dofs_;
 };
@@ -60,6 +60,7 @@ public:
   void warmup_controller(int warmup_iters, TorchRobotState &init_robot_state);
 
   std::vector<float> forward(TorchRobotState &input);
+  void forward_into(std::vector<float> &output, TorchRobotState &input);
 
   bool param_dict_load(char *data, std::size_t size);
   void param_dict_update_module();

@@ -6,6 +6,7 @@ import logging
 import tempfile
 import subprocess
 import sys
+import os
 
 import omegaconf
 from omegaconf import OmegaConf
@@ -68,10 +69,17 @@ class ExecutableRobotClient(AbstractRobotClient):
                 path_to_exec = which(self.executable_cfg.exec)
                 assert path_to_exec, f"Unable to find binary {self.executable_cfg.exec}"
 
-                # Add sudo if realtime; also, inherit $PATH variable
+                # Add sudo if realtime and pass PATH / POLYMETIS_RT_CPU via
+                # env(1) arguments. Do not embed shell quotes here: subprocess
+                # executes the argv list directly.
                 command_list = [path_to_exec, cfg_file.name]
                 if self.use_real_time:
-                    command_list = ["sudo", "env", '"PATH=$PATH"'] + command_list
+                    command_list = [
+                        "sudo",
+                        "env",
+                        f"PATH={os.environ.get('PATH', '')}",
+                        f"POLYMETIS_RT_CPU={os.environ.get('POLYMETIS_RT_CPU', '')}",
+                    ] + command_list
 
                 # Run
                 log.info(f"=== Executing client at {path_to_exec} ===")

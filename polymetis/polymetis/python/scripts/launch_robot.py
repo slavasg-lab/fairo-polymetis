@@ -42,13 +42,40 @@ def main(cfg):
     server_cmd = [server_exec_path]
     server_cmd = server_cmd + ["-s", ip, "-p", port]
 
+    # CPU affinity: pin server and client to already-isolated cores (isolcpus=4-7).
+    # Core 4: run_server, Core 5: franka_panda_client RT thread.
+    # Cores 6-7 remain available for gripper client and other RT tasks.
+    # Override via env vars POLYMETIS_SERVER_CPU / POLYMETIS_RT_CPU or cfg keys.
+    server_cpu = str(getattr(cfg, "server_cpu", os.environ.get("POLYMETIS_SERVER_CPU", "4")))
+    client_cpu = str(getattr(cfg, "client_cpu", os.environ.get("POLYMETIS_RT_CPU", "5")))
+    os.environ["POLYMETIS_RT_CPU"] = client_cpu
+
     if cfg.use_real_time:
         log.info(f"Acquiring sudo...")
         subprocess.run(["sudo", "echo", '"Acquired sudo."'], check=True)
 
-        server_cmd = ["sudo", "-s", "env", '"PATH=$PATH"'] + server_cmd + ["-r"]
+        # Build a clean env for the server subprocess: propagate the full
+        # current environment plus the RT-CPU override. sudo(8) typically
+        # strips the environment unless configured otherwise; passing variables
+        # explicitly via 'env KEY=VALUE ...' is the safe portable approach.
+        # Do NOT use embedded shell quotes — subprocess with a list does NOT
+        # go through a shell, so quotes would be passed literally.
+        server_env = os.environ.copy()
+        server_env["POLYMETIS_RT_CPU"] = server_cpu
+
+        server_cmd = [
+            "sudo", "env",
+            f"PATH={server_env['PATH']}",
+            f"POLYMETIS_RT_CPU={server_cpu}",
+            "taskset", "-c", server_cpu,
+        ] + server_cmd + ["-r"]
+        log.info(f"Server pinned to CPU {server_cpu}, client will use CPU {client_cpu}")
+    else:
+        server_env = None  # inherit from current process
+
     server_output = subprocess.Popen(
-        server_cmd, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=os.setpgrp
+        server_cmd, stdout=sys.stdout, stderr=sys.stderr,
+        preexec_fn=os.setpgrp, env=server_env,
     )
     pgid = os.getpgid(server_output.pid)
 
@@ -60,13 +87,19 @@ def main(cfg):
                 f"Using sudo to kill subprocess with pid {server_output.pid}, pgid {pgid}..."
             )
             # send NEGATIVE of process group ID to kill process tree
-            subprocess.check_call(["sudo", "kill", "-9", f"-{pgid}"])
+            try:
+                subprocess.check_call(["sudo", "kill", "-9", f"-{pgid}"])
+            except subprocess.CalledProcessError:
+                pass
 
     else:
 
         def cleanup():
             log.info(f"Killing subprocess with pid {server_output.pid}, pgid {pgid}...")
-            subprocess.check_call(["kill", "-9", f"-{pgid}"])
+            try:
+                subprocess.check_call(["kill", "-9", f"-{pgid}"])
+            except subprocess.CalledProcessError:
+                pass
 
     atexit.register(cleanup)
     signal.signal(signal.SIGTERM, lambda signal_number, stack_frame: cleanup())
